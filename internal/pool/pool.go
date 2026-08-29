@@ -1,6 +1,9 @@
 package pool
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 type Backend struct {
 	Addr             string
@@ -9,6 +12,22 @@ type Backend struct {
 	healthy          bool
 	consecutiveFails int
 	consecutiveOks   int
+	activeConns      atomic.Int64
+}
+
+// IncActiveConns records that a connection/request has just been routed
+// to this backend. Pair with a deferred DecActiveConns wherever a
+// connection's lifecycle is known to start and end.
+func (b *Backend) IncActiveConns() {
+	b.activeConns.Add(1)
+}
+
+func (b *Backend) DecActiveConns() {
+	b.activeConns.Add(-1)
+}
+
+func (b *Backend) ActiveConns() int64 {
+	return b.activeConns.Load()
 }
 
 func (b *Backend) RecordFailure(threshold int) {

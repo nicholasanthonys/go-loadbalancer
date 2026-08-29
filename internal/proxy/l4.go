@@ -33,6 +33,9 @@ func handleConn(client net.Conn, b balancer.Balancer) {
 	if err != nil {
 		return
 	}
+	backend.IncActiveConns()
+	defer backend.DecActiveConns()
+
 	upstream, err := net.DialTimeout("tcp", backend.Addr, 5*time.Second)
 	if err != nil {
 		return

@@ -23,7 +23,7 @@ func TestRoundRobin_CyclesInOrder(t *testing.T) {
 		if actual == nil {
 			t.Fatalf("expected a backend, got nil")
 		}
-		if actual != nil && actual.Addr != expectedOrder[i] {
+		if actual.Addr != expectedOrder[i] {
 			t.Errorf("Expected %s, got %s", expectedOrder[i], actual.Addr)
 		}
 	}

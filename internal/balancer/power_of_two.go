@@ -23,10 +23,10 @@ func (p2c *PowerOfTwoChoices) Pick() (*pool.Backend, error) {
 		return backends[0], nil
 	}
 
-	// and.Intn(len(backends)) for the first index; for the
+	// rand.Intn(len(backends)) for the first index; for the
 	// second, rand.Intn(len(backends)-1), then nudge it past the first
 	// index if it would otherwise land on or after it. This guarantees
-	// two distinct indices with no sretry loop needed.
+	// two distinct indices with no retry loop needed.
 
 	firstIdx := rand.Intn(len(backends))
 	secondIdx := rand.Intn(len(backends) - 1)

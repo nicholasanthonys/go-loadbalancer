@@ -8,7 +8,7 @@ import (
 	"github.com/nicholasanthonys/gobalance/internal/pool"
 )
 
-type Checker struct {
+type TCPChecker struct {
 	Pool           *pool.Pool
 	Interval       time.Duration
 	Timeout        time.Duration
@@ -16,7 +16,7 @@ type Checker struct {
 	HealthyThresh  int
 }
 
-func (c *Checker) Run(ctx context.Context) {
+func (c *TCPChecker) Run(ctx context.Context) {
 	ticker := time.NewTicker(c.Interval)
 	defer ticker.Stop()
 
@@ -32,10 +32,9 @@ func (c *Checker) Run(ctx context.Context) {
 	}
 }
 
-func (c *Checker) checkOne(b *pool.Backend) {
+func (c *TCPChecker) checkOne(b *pool.Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, c.Timeout)
 	if err != nil {
-		// Handle error
 		b.RecordFailure(c.UnhealthyTresh)
 		return
 	}

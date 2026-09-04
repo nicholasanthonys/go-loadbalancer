@@ -1,0 +1,35 @@
+listeners:
+  - name: l4-demo
+    type: l4
+    listen: "localhost:9090"
+    algorithm: round_robin
+    health_check:
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+    backends:
+      - addr: "localhost:9101"
+        weight: 1
+      - addr: "localhost:9102"
+        weight: 1
+      - addr: "localhost:9103"
+        weight: 1
+
+  - name: l7-demo
+    type: l7
+    listen: ":9091"
+    algorithm: round_robin
+    health_check:
+      path: /healthz
+      interval: 5s
+      timeout: 2s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+    backends:
+      - addr: "localhost:9101"
+        weight: 1
+      - addr: "localhost:9102"
+        weight: 1
+      - addr: "localhost:9103"
+        weight: 1

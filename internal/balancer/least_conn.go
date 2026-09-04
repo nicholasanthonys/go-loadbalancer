@@ -6,6 +6,10 @@ type LeastConn struct {
 	pool *pool.Pool
 }
 
+func NewLeastConn(p *pool.Pool) *LeastConn {
+	return &LeastConn{pool: p}
+}
+
 func (l *LeastConn) Pick() (*pool.Backend, error) {
 	backends := l.pool.Healthy()
 	if len(backends) == 0 {

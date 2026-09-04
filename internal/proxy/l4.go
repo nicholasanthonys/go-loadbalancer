@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"io"
 	"net"
 	"sync"
@@ -9,10 +10,15 @@ import (
 	"github.com/nicholasanthonys/gobalance/internal/balancer"
 )
 
-func ServeL4(listenAddr string, b balancer.Balancer) error {
-
+func ServeL4(listenAddr string, b balancer.Balancer, tlsConfig *tls.Config) error {
+	var ln net.Listener
+	var err error
 	// open a TCP listener to accept incoming connections on the specified address
-	ln, err := net.Listen("tcp", listenAddr)
+	if tlsConfig != nil {
+		ln, err = tls.Listen("tcp", listenAddr, tlsConfig)
+	} else {
+		ln, err = net.Listen("tcp", listenAddr)
+	}
 	if err != nil {
 		return err
 	}

@@ -37,10 +37,24 @@ func main() {
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
 
+	// pools is a listener-name -> *pool.Pool registry, built once here and
+	// never structurally modified afterward (no keys added or removed) — a
+	// future config reload looks up a listener's pool by name and calls
+	// Pool.SetBackends on it. Because this map is only written during this
+	// startup loop, before any reload-watcher goroutine exists, later
+	// concurrent reads of the map by a reload goroutine are safe without a
+	// lock of their own; the *pool.Pool values it points to already guard
+	// their own state internally.
+	pools := make(map[string]*pool.Pool, len(cfg.Listeners))
 	for _, l := range cfg.Listeners {
+		pools[l.Name] = buildPool(l)
+	}
+
+	for _, l := range cfg.Listeners {
+		p := pools[l.Name]
 		go func() {
 			fmt.Printf("listener %q (%s) starting on %s\n", l.Name, l.Type, l.Listen)
-			if err := startListener(l, tlsConfig); err != nil {
+			if err := startListener(l, p, tlsConfig); err != nil {
 				fmt.Printf("listener %q stopped: %v\n", l.Name, err)
 			}
 		}()
@@ -49,10 +63,9 @@ func main() {
 	select {} // keep main alive; real graceful shutdown comes in Phase 8
 }
 
-// startListener builds the pool/balancer/health-checker for a single
-// config.Listener and then starts serving it. It blocks for as long as
-// the listener is running and returns the error that stopped it.
-func startListener(l config.Listener, tlsConfig *tls.Config) error {
+// buildPool constructs the *pool.Pool for a single config.Listener from its
+// backend list.
+func buildPool(l config.Listener) *pool.Pool {
 	var addrs []string
 	for _, backend := range l.Backends {
 		addrs = append(addrs, backend.Addr)
@@ -62,7 +75,14 @@ func startListener(l config.Listener, tlsConfig *tls.Config) error {
 	for i := range l.Backends {
 		p.Backends[i].Weight = l.Backends[i].Weight
 	}
+	return p
+}
 
+// startListener wires up the balancer and health-checker for a single
+// config.Listener around an already-built *pool.Pool, then starts serving
+// it. It blocks for as long as the listener is running and returns the
+// error that stopped it.
+func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config) error {
 	bal, err := balancer.New(l.Algorithm, p)
 	if err != nil {
 		return fmt.Errorf("listener %q: %w", l.Name, err)

@@ -60,6 +60,7 @@ func (b *Backend) IsHealthy() bool {
 
 type Pool struct {
 	Backends []*Backend
+	mu       sync.RWMutex
 }
 
 func New(addrs []string) *Pool {
@@ -72,10 +73,14 @@ func New(addrs []string) *Pool {
 }
 
 func (p *Pool) All() []*Backend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.Backends
 }
 
 func (p *Pool) Healthy() []*Backend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	var healthyBackends []*Backend
 
 	for _, backend := range p.Backends {
@@ -84,4 +89,30 @@ func (p *Pool) Healthy() []*Backend {
 		}
 	}
 	return healthyBackends
+}
+
+type BackendSpec struct {
+	Addr   string
+	Weight int
+}
+
+func (p *Pool) SetBackends(specs []BackendSpec) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	old := make(map[string]*Backend, len(p.Backends))
+	for _, b := range p.Backends {
+		old[b.Addr] = b
+	}
+
+	newBackends := make([]*Backend, 0, len(specs))
+	for _, spec := range specs {
+		if b, ok := old[spec.Addr]; ok {
+			b.Weight = spec.Weight
+			newBackends = append(newBackends, b)
+		} else {
+			newBackends = append(newBackends, &Backend{Addr: spec.Addr, Weight: spec.Weight, healthy: false})
+		}
+	}
+	p.Backends = newBackends
 }

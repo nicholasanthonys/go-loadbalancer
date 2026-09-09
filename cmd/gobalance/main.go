@@ -5,7 +5,15 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"github.com/nicholasanthonys/gobalance/internal/balancer"
 	"github.com/nicholasanthonys/gobalance/internal/config"
@@ -25,6 +33,7 @@ func main() {
 		fmt.Println("Error loading config:", err)
 		return
 	}
+	store := config.NewStore(cfg)
 	fmt.Println("Loaded config:", *configPath, "-", len(cfg.Listeners), "listener(s)")
 
 	var tlsConfig *tls.Config
@@ -45,12 +54,22 @@ func main() {
 	// concurrent reads of the map by a reload goroutine are safe without a
 	// lock of their own; the *pool.Pool values it points to already guard
 	// their own state internally.
-	pools := make(map[string]*pool.Pool, len(cfg.Listeners))
-	for _, l := range cfg.Listeners {
+	pools := make(map[string]*pool.Pool, len(store.Get().Listeners))
+	started := make(map[string]config.Listener, len(store.Get().Listeners))
+	for _, l := range store.Get().Listeners {
 		pools[l.Name] = buildPool(l)
+		started[l.Name] = l
 	}
 
-	for _, l := range cfg.Listeners {
+	reload := func() {
+		if err := store.Reload(*configPath); err != nil {
+			log.Printf("reload: bad config, keeping old one: %v", err)
+			return
+		}
+		applyConfig(store.Get(), pools, started)
+	}
+
+	for _, l := range store.Get().Listeners {
 		p := pools[l.Name]
 		go func() {
 			fmt.Printf("listener %q (%s) starting on %s\n", l.Name, l.Type, l.Listen)
@@ -60,21 +79,94 @@ func main() {
 		}()
 	}
 
+	// Reload trigger 1: SIGHUP. `kill -HUP <pid>` re-reads the config file.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			log.Println("reload: SIGHUP received")
+			reload()
+		}
+	}()
+
+	// Reload trigger 2: config file changes on disk. We watch the containing
+	// directory, not the file itself: editors save by writing a temp file and
+	// renaming it over the original, which invalidates a watch held directly on
+	// the file. One save often emits several events, so we debounce — reset a
+	// 200ms timer on every relevant event and only call reload() once it fires.
+	if watcher, err := fsnotify.NewWatcher(); err != nil {
+		log.Printf("reload: file watching disabled: %v", err)
+	} else if err := watcher.Add(filepath.Dir(*configPath)); err != nil {
+		log.Printf("reload: file watching disabled: %v", err)
+		watcher.Close()
+	} else {
+		go func() {
+			defer watcher.Close()
+			var debounce *time.Timer
+			for {
+				select {
+				case event, ok := <-watcher.Events:
+					if !ok {
+						return
+					}
+					if filepath.Clean(event.Name) != filepath.Clean(*configPath) {
+						continue
+					}
+					if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+						continue
+					}
+					if debounce != nil {
+						debounce.Stop()
+					}
+					debounce = time.AfterFunc(200*time.Millisecond, reload)
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						return
+					}
+					log.Printf("reload: watcher error: %v", err)
+				}
+			}
+		}()
+	}
+
 	select {} // keep main alive; real graceful shutdown comes in Phase 8
+}
+
+// applyConfig takes a freshly-reloaded config and pushes whatever changes
+// are safe to apply live (backend list + weights) onto the running pools.
+// Algorithm/type changes are logged and ignored — those need a restart.
+
+func applyConfig(newCfg *config.Config, pools map[string]*pool.Pool, started map[string]config.Listener) {
+	for _, l := range newCfg.Listeners { // <-- for each listener in the new confrig
+		p, ok := pools[l.Name] // <-- look up the pool for that listener by name
+		if !ok {
+			log.Printf("reload: listener %q is new; adding listeners needs a restart, skipping", l.Name)
+			continue
+		}
+
+		old := started[l.Name] // <-- look up the listener that was started for that pool
+		if l.Algorithm != old.Algorithm || l.Type != old.Type {
+			log.Printf("reload: listener %q algorithm/type change needs a restart, ignoring that part", l.Name)
+		}
+
+		specs := make([]pool.BackendSpec, 0, len(l.Backends))
+		for _, b := range l.Backends {
+			specs = append(specs, pool.BackendSpec{Addr: b.Addr, Weight: b.Weight})
+		}
+		p.SetBackends(specs)
+	}
 }
 
 // buildPool constructs the *pool.Pool for a single config.Listener from its
 // backend list.
 func buildPool(l config.Listener) *pool.Pool {
-	var addrs []string
-	for _, backend := range l.Backends {
-		addrs = append(addrs, backend.Addr)
+	specs := make([]pool.BackendSpec, 0, len(l.Backends))
+	for _, b := range l.Backends {
+		specs = append(specs, pool.BackendSpec{Addr: b.Addr, Weight: b.Weight})
 	}
 
-	p := pool.New(addrs)
-	for i := range l.Backends {
-		p.Backends[i].Weight = l.Backends[i].Weight
-	}
+	p := pool.New(nil)
+	p.SetBackends(specs)
 	return p
 }
 

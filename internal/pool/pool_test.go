@@ -59,8 +59,8 @@ func TestSetBackends_ReusesExistingBackend(t *testing.T) {
 	if got.ActiveConns() != 1 {
 		t.Fatalf("expected reused backend to keep its active connection count, got %d", got.ActiveConns())
 	}
-	if got.Weight != 5 {
-		t.Fatalf("expected reused backend's weight to be updated to 5, got %d", got.Weight)
+	if got.Weight() != 5 {
+		t.Fatalf("expected reused backend's weight to be updated to 5, got %d", got.Weight())
 	}
 
 	newBackend := all[1]

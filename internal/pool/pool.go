@@ -7,12 +7,26 @@ import (
 
 type Backend struct {
 	Addr             string
-	Weight           int
+	weight           atomic.Int64
 	mu               sync.Mutex
 	healthy          bool
 	consecutiveFails int
 	consecutiveOks   int
 	activeConns      atomic.Int64
+}
+
+// Weight returns the backend's current load-balancing weight. It is read on
+// every Pick() by the weighted algorithms and may be updated concurrently by
+// a config reload, so it is stored atomically.
+func (b *Backend) Weight() int {
+	return int(b.weight.Load())
+}
+
+// SetWeight updates the backend's load-balancing weight. Called by
+// Pool.SetBackends during a config reload while the weighted algorithms may
+// be reading it.
+func (b *Backend) SetWeight(w int) {
+	b.weight.Store(int64(w))
 }
 
 // IncActiveConns records that a connection/request has just been routed
@@ -64,10 +78,11 @@ type Pool struct {
 }
 
 func New(addrs []string) *Pool {
-
 	p := &Pool{}
 	for _, addr := range addrs {
-		p.Backends = append(p.Backends, &Backend{Addr: addr, Weight: 1, healthy: false, consecutiveFails: 0, consecutiveOks: 0})
+		b := &Backend{Addr: addr, healthy: false}
+		b.SetWeight(1)
+		p.Backends = append(p.Backends, b)
 	}
 	return p
 }
@@ -96,6 +111,10 @@ type BackendSpec struct {
 	Weight int
 }
 
+// SetBackends replaces the pool's backend set from specs, reusing the existing
+// *Backend for any address that survives the change so its health state,
+// hysteresis counters, and active-connection count carry over. Genuinely new
+// addresses start unhealthy, pending their own health checks.
 func (p *Pool) SetBackends(specs []BackendSpec) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -108,10 +127,12 @@ func (p *Pool) SetBackends(specs []BackendSpec) {
 	newBackends := make([]*Backend, 0, len(specs))
 	for _, spec := range specs {
 		if b, ok := old[spec.Addr]; ok {
-			b.Weight = spec.Weight
+			b.SetWeight(spec.Weight)
 			newBackends = append(newBackends, b)
 		} else {
-			newBackends = append(newBackends, &Backend{Addr: spec.Addr, Weight: spec.Weight, healthy: false})
+			nb := &Backend{Addr: spec.Addr, healthy: false}
+			nb.SetWeight(spec.Weight)
+			newBackends = append(newBackends, nb)
 		}
 	}
 	p.Backends = newBackends

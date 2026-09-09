@@ -37,9 +37,13 @@ Currently implemented:
   number of listeners, each with its own type (`l4`/`l7`), algorithm, backends, and health-check
   settings; `main.go` builds a pool/balancer/health-checker per listener from it and runs each on
   its own goroutine.
+- **Hot reload** ([`internal/config/store.go`](internal/config/store.go)) — `SIGHUP` (`kill -HUP
+  <pid>`) or saving the config file re-reads and re-validates it; a bad edit is logged and the old
+  config keeps serving. Backend list and weight changes apply live without dropping in-flight
+  connections (surviving backends keep their health state). Changing a listener's algorithm or type,
+  or adding/removing listeners, still needs a restart — those are logged and ignored on reload.
 
-Not yet implemented: hot reload on config-file change (the config *loads* correctly today, but
-editing it requires a restart), metrics/logging, graceful shutdown, and the Docker Compose demo. See
+Not yet implemented: metrics/logging, graceful shutdown, and the Docker Compose demo. See
 [`docs/TUTORIAL.md`](docs/TUTORIAL.md)'s progress table for exact phase-by-phase status.
 
 ## Running it
@@ -109,6 +113,13 @@ The L4 listener proxies raw TCP the same way — `openssl s_client -connect loca
 localhost 9090` with `-tls=false`) will get you a response from whichever backend port it picked,
 though there's no HTTP framing to make the round-robin cycling as easy to eyeball as the L7 example
 above.
+
+### Reloading config
+
+Edit `configs/example.yaml` (add/remove a backend, change a weight) and either save it — the running
+process watches the file — or send `kill -HUP $(pgrep -f gobalance)`. The change applies without
+dropping connections. A syntactically or semantically invalid edit is logged and the previous config
+keeps serving. Algorithm/type changes and listener add/remove require a restart.
 
 ## Testing
 

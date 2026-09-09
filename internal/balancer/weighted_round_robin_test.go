@@ -8,8 +8,8 @@ import (
 
 func TestWeightedRoundRobin_MatchesWeightRatio(t *testing.T) {
 	p := pool.New([]string{"A", "B"})
-	p.Backends[0].Weight = 3
-	p.Backends[1].Weight = 1
+	p.Backends[0].SetWeight(3)
+	p.Backends[1].SetWeight(1)
 	p.Backends[0].RecordSuccess(1)
 	p.Backends[1].RecordSuccess(1)
 

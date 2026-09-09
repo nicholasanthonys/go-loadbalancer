@@ -32,8 +32,8 @@ func (w *WeightedRoundRobin) Pick() (*pool.Backend, error) {
 	var best *pool.Backend
 
 	for _, b := range backends {
-		w.current[b] += b.Weight
-		totalWeight += b.Weight
+		w.current[b] += b.Weight()
+		totalWeight += b.Weight()
 		if best == nil || w.current[b] > w.current[best] {
 			best = b
 		}

@@ -20,6 +20,52 @@ A useful mental model: L4 is a smart cable — it decides once, at connect time,
 
 GoBalance implements both because the tradeoff is worth demonstrating directly: the L4 path is simpler and shows the raw socket-forwarding mechanics, while the L7 path built on `httputil.ReverseProxy` shows request-aware routing and header manipulation.
 
+The "decides once vs. decides per request" distinction isn't just theoretical — it has a concrete, observable consequence: **when a backend is picked.**
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L4 as L4 Listener
+    participant Bal as Balancer/Pool
+    participant B as Backend
+
+    C->>L4: open TCP connection
+    L4->>Bal: Pick()
+    Bal-->>L4: backend A
+    L4->>B: dial backend A, relay bytes
+    Note over C,B: connection stays open (e.g. HTTP keep-alive)
+    C->>L4: request 1 (raw bytes)
+    L4->>B: relayed as-is
+    C->>L4: request 2 (raw bytes, same connection)
+    L4->>B: relayed as-is
+    Note over L4,Bal: Pick() never runs again —<br/>it only happens once, at connect time
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L7 as L7 Listener (ReverseProxy)
+    participant Bal as Balancer/Pool
+    participant B as Backend(s)
+
+    C->>L7: request 1 (same keep-alive connection)
+    L7->>Bal: Pick()
+    Bal-->>L7: backend A
+    L7->>B: forward request 1
+    B-->>L7: response 1
+    L7-->>C: response 1
+
+    C->>L7: request 2 (same keep-alive connection)
+    L7->>Bal: Pick()
+    Bal-->>L7: backend B
+    L7->>B: forward request 2
+    B-->>L7: response 2
+    L7-->>C: response 2
+    Note over L7,Bal: Pick() runs again per request,<br/>even though the client connection was reused
+```
+
+This is exactly the kind of detail that only bites you in practice: a browser-based traffic generator built for this project's demo UI used `fetch()` against the L4 listener and appeared to send no traffic at all after the first request. The browser was reusing its keep-alive TCP connection to `localhost:9090` — invisible to L7 (which re-picks per request regardless), but fatal to L4, which never gets a second chance to route once a connection is already open. The fix was to force a genuinely new TCP connection per "request" (a fresh `WebSocket` rather than `fetch`) — a `curl` loop sidesteps the same problem for a different reason: each `curl` process is its own connection from the start.
+
 ## 3. Load-Balancing Algorithms
 
 All algorithms answer the same question — "given a set of healthy backends, which one gets this connection/request?" — with different tradeoffs between simplicity, fairness, and adaptiveness to real backend load.

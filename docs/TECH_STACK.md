@@ -43,33 +43,24 @@ Everything else — the proxy core, the algorithms, the health checker, the conf
 
 ## 4. Architecture
 
-```
-                                   ┌─────────────────────────┐
-                                   │        GoBalance          │
-                                   │                          │
- clients ──TCP/TLS──▶ L4 Listener │  ┌──────────────┐        │
-                                   │  │  Backend Pool │◀──┐    │
- clients ──HTTP/TLS─▶ L7 Listener │  │  (per listener)│   │    │
-                                   │  └──────┬───────┘   │    │
-                                   │         │            │    │
-                                   │  ┌──────▼───────┐    │    │
-                                   │  │  Algorithm    │    │    │
-                                   │  │  (RR / LC /   │    │    │
-                                   │  │  Weighted...) │    │    │
-                                   │  └──────┬───────┘    │    │
-                                   │         │            │    │
-                                   │  ┌──────▼───────┐    │    │
-                                   │  │Health Checker │────┘    │
-                                   │  │(active+passive)│         │
-                                   │  └──────────────┘          │
-                                   │                          │
-                                   │  /metrics   /healthz     │
-                                   │  slog → stdout (JSON)    │
-                                   └────────────┬─────────────┘
-                                                │
-                                    ┌───────────┼───────────┐
-                                    ▼           ▼           ▼
-                               backend-1   backend-2   backend-3
+```mermaid
+flowchart LR
+    C1[Clients<br/>TCP/TLS] -->|raw bytes| L4[L4 Listener]
+    C2[Clients<br/>HTTP/TLS] -->|HTTP requests| L7[L7 Listener]
+
+    subgraph GB[GoBalance]
+        direction LR
+        L4 --> POOL[(Backend Pool<br/>per listener)]
+        L7 --> POOL
+        POOL --> ALGO[Balancer<br/>RR / LC / Weighted / ...]
+        ALGO <--> HC[Health Checker<br/>active + passive]
+        L4 -.-> OBS[/metrics + slog/]
+        L7 -.-> OBS
+    end
+
+    ALGO --> B1[backend-1]
+    ALGO --> B2[backend-2]
+    ALGO --> B3[backend-3]
 ```
 
 Each **listener** (L4 or L7) owns a reference to a **backend pool**: a slice of backend definitions (address, weight) plus shared, concurrency-safe state (health status, active connection count). The **algorithm** is a small interface (`Pick(pool) (*Backend, error)`) so round robin, least-connections, etc. are interchangeable strategies over the same pool — this is the one place a classic Strategy pattern is worth using. The **health checker** runs independently per pool, mutating shared backend state that both the algorithm and the proxy read.

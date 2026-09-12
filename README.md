@@ -9,33 +9,30 @@ The point of the project is to demonstrate systems-level engineering — concurr
 `-race`, graceful failure handling, observability — rather than to compete with nginx/HAProxy/Envoy on
 features or performance; see [`docs/PRD.md`](docs/PRD.md) for the explicit non-goals.
 
-```
-                                   ┌─────────────────────────┐
-                                   │        GoBalance          │
-                                   │                          │
- clients ──TCP/TLS──▶ L4 Listener │  ┌──────────────┐        │
-                                   │  │  Backend Pool │◀──┐    │
- clients ──HTTP/TLS─▶ L7 Listener │  │  (per listener)│   │    │
-                                   │  └──────┬───────┘   │    │
-                                   │         │            │    │
-                                   │  ┌──────▼───────┐    │    │
-                                   │  │  Algorithm    │    │    │
-                                   │  │  (RR / LC /   │    │    │
-                                   │  │  Weighted...) │    │    │
-                                   │  └──────┬───────┘    │    │
-                                   │         │            │    │
-                                   │  ┌──────▼───────┐    │    │
-                                   │  │Health Checker │────┘    │
-                                   │  │(active+passive)│         │
-                                   │  └──────────────┘          │
-                                   │                          │
-                                   │  /metrics   /healthz     │
-                                   │  slog → stdout (JSON)    │
-                                   └────────────┬─────────────┘
-                                                │
-                                    ┌───────────┼───────────┐
-                                    ▼           ▼           ▼
-                               backend-1   backend-2   backend-3
+![Traffic flowing across three backends, then rerouting live when one is killed](docs/demo.gif)
+
+*Live traffic distributed round-robin across three backends, then rerouted within a couple of
+health-check intervals after one is killed — captured from the browser-based visualizer in
+[`deploy/demo-ui`](deploy/demo-ui), which polls GoBalance's own `/metrics` endpoint in real time.*
+
+```mermaid
+flowchart LR
+    C1[Clients<br/>TCP/TLS] -->|raw bytes| L4[L4 Listener]
+    C2[Clients<br/>HTTP/TLS] -->|HTTP requests| L7[L7 Listener]
+
+    subgraph GB[GoBalance]
+        direction LR
+        L4 --> POOL[(Backend Pool<br/>per listener)]
+        L7 --> POOL
+        POOL --> ALGO[Balancer<br/>RR / LC / Weighted / ...]
+        ALGO <--> HC[Health Checker<br/>active + passive]
+        L4 -.-> OBS[/metrics + slog/]
+        L7 -.-> OBS
+    end
+
+    ALGO --> B1[backend-1]
+    ALGO --> B2[backend-2]
+    ALGO --> B3[backend-3]
 ```
 
 Full design rationale lives in [`docs/`](docs/):

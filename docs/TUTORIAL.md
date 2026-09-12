@@ -899,37 +899,252 @@ Wire `fsnotify` to call `Reload` on file change, and/or a `SIGHUP` handler via `
 
 ## Phase 7 — Observability: Structured Logging + Metrics
 
-**Goal:** JSON logs via `log/slog`; a `/metrics` endpoint via `prometheus/client_golang`.
+**Goal:** JSON logs via `log/slog` for requests, reloads, and health transitions; a `/metrics` endpoint via `prometheus/client_golang` exposing request counts/latency, per-backend active connections and health, and a reload counter.
+
+**Concepts:** THEORY.md §8 (why observability is part of correctness for a proxy, not an add-on). Two different aggregation styles are used here on purpose: push-style counters/histograms (`RequestsTotal`, `RequestDuration`, `ReloadsTotal`) that get incremented at the moment an event happens, vs. a pull-style custom `Collector` for per-backend gauges (`ActiveConns`, `IsHealthy`) that reads state already living on `*pool.Backend` at scrape time instead of duplicating it into a separately-maintained `GaugeVec`. Prefer reading existing state over mirroring it into a second variable that can drift out of sync.
+
+**Dependency:** `go get github.com/prometheus/client_golang/prometheus` (and `.../prometheus/promhttp`) — already on the approved list in CLAUDE.md/TECH_STACK.md §3.
+
+### Step 1 — logger construction (`internal/logging/logging.go`, full file)
+
+One JSON `*slog.Logger`, built once in `main.go` and threaded down to whatever needs to log — no package-level global, so tests can pass their own logger (or `slog.New(slog.DiscardHandler)`) instead of polluting test output.
 
 ```go
 // internal/logging/logging.go
-logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-logger.Info("backend health changed", "backend", b.Addr, "healthy", b.IsHealthy())
+package logging
+
+import (
+    "log/slog"
+    "os"
+)
+
+func New() *slog.Logger {
+    return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
 ```
+
+### Step 2 — health-transition logging (`internal/healthcheck/tcp.go` + `http.go`)
+
+`RecordFailure`/`RecordSuccess` don't report whether they actually flipped `healthy` — and shouldn't; that's pool-package internal bookkeeping, not a logging concern. The checker already calls `IsHealthy()` elsewhere, so it's the right place to notice a transition: read it before and after the check, log only when it changed.
+
+```go
+// internal/healthcheck/tcp.go
+type TCPChecker struct {
+    Pool           *pool.Pool
+    Interval       time.Duration
+    Timeout        time.Duration
+    UnhealthyTresh int
+    HealthyThresh  int
+    Logger         *slog.Logger
+}
+
+func (c *TCPChecker) checkOne(b *pool.Backend) {
+    before := b.IsHealthy()
+
+    conn, err := net.DialTimeout("tcp", b.Addr, c.Timeout)
+    if err != nil {
+        b.RecordFailure(c.UnhealthyTresh)
+    } else {
+        conn.Close()
+        b.RecordSuccess(c.HealthyThresh)
+    }
+
+    if after := b.IsHealthy(); after != before {
+        c.Logger.Info("backend health changed", "backend", b.Addr, "healthy", after)
+    }
+}
+```
+
+`HTTPChecker.checkOne` gets the identical `before`/`after` wrapping around its existing dial/status-check logic, plus the same `Logger *slog.Logger` field on the struct.
+
+### Step 3 — counters and histograms (`internal/metrics/metrics.go`, full file)
 
 ```go
 // internal/metrics/metrics.go
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
 var (
     RequestsTotal = prometheus.NewCounterVec(
-        prometheus.CounterOpts{Name: "gobalance_requests_total"},
-        []string{"listener", "backend", "status"},
+        prometheus.CounterOpts{Name: "gobalance_requests_total", Help: "Total requests handled, by listener and outcome."},
+        []string{"listener", "status"},
     )
     RequestDuration = prometheus.NewHistogramVec(
-        prometheus.HistogramOpts{Name: "gobalance_request_duration_seconds"},
+        prometheus.HistogramOpts{Name: "gobalance_request_duration_seconds", Help: "Request/connection duration by listener."},
         []string{"listener"},
     )
-    BackendHealthy = prometheus.NewGaugeVec(
-        prometheus.GaugeOpts{Name: "gobalance_backend_healthy"},
-        []string{"backend"},
+    ReloadsTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{Name: "gobalance_reloads_total", Help: "Config reload attempts, by result."},
+        []string{"result"}, // "success" or "failure"
     )
 )
-// register all in an init() or explicit Register(), then:
-http.Handle("/metrics", promhttp.Handler())
+
+func init() {
+    prometheus.MustRegister(RequestsTotal, RequestDuration, ReloadsTotal)
+}
 ```
 
-Increment `RequestsTotal` and observe `RequestDuration` from the L7 handler's `ModifyResponse`/wrapped `ResponseWriter`; set `BackendHealthy` from the health checker on every state transition.
+`status` for the L4 listener won't be an HTTP status — use something like `"ok"`/`"error"` there, and the real status code (`"200"`, `"503"`, ...) for L7.
 
-**Checkpoint:** `curl localhost:<metrics-port>/metrics` shows real counters moving as you generate traffic. Bonus: spin up a local Prometheus + Grafana via docker-compose and build one dashboard panel showing per-backend request rate — a screenshot of this is strong portfolio material.
+### Step 4 — per-backend gauges via a custom `Collector` (`internal/metrics/collector.go`, full file)
+
+A `GaugeVec` needs something to call `.Set()` on it every time active-conn counts or health state change — but those already live on `*pool.Backend` (`ActiveConns()`, `IsHealthy()`), updated by `l4.go`/`l7.go`/the health checkers. Rather than shadow that state, implement `prometheus.Collector` directly and read it live on every scrape:
+
+```go
+// internal/metrics/collector.go
+package metrics
+
+import (
+    "github.com/prometheus/client_golang/prometheus"
+
+    "github.com/nicholasanthonys/gobalance/internal/pool"
+)
+
+var (
+    activeConnsDesc = prometheus.NewDesc(
+        "gobalance_backend_active_connections", "Current active connections per backend.",
+        []string{"listener", "backend"}, nil,
+    )
+    backendHealthyDesc = prometheus.NewDesc(
+        "gobalance_backend_healthy", "1 if the backend is currently healthy, else 0.",
+        []string{"listener", "backend"}, nil,
+    )
+)
+
+// BackendCollector reads live state off each listener's pool at scrape
+// time instead of caching it. Pools is the same listener-name -> *pool.Pool
+// registry main.go already builds at startup; it's read-only after startup,
+// so sharing it here needs no extra locking.
+type BackendCollector struct {
+    Pools map[string]*pool.Pool
+}
+
+func (c *BackendCollector) Describe(ch chan<- *prometheus.Desc) {
+    ch <- activeConnsDesc
+    ch <- backendHealthyDesc
+}
+
+func (c *BackendCollector) Collect(ch chan<- prometheus.Metric) {
+    for listener, p := range c.Pools {
+        for _, b := range p.All() {
+            ch <- prometheus.MustNewConstMetric(activeConnsDesc, prometheus.GaugeValue, float64(b.ActiveConns()), listener, b.Addr)
+            healthy := 0.0
+            if b.IsHealthy() {
+                healthy = 1
+            }
+            ch <- prometheus.MustNewConstMetric(backendHealthyDesc, prometheus.GaugeValue, healthy, listener, b.Addr)
+        }
+    }
+}
+```
+
+### Step 5 — wire it into the L4 path (`internal/proxy/l4.go`)
+
+`ServeL4`/`handleConn` need a logger and the listener's name (for metric labels and log lines) threaded through:
+
+```go
+func ServeL4(listenAddr string, b balancer.Balancer, tlsConfig *tls.Config, logger *slog.Logger, listenerName string) error {
+    // ...unchanged listener setup...
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            continue
+        }
+        go handleConn(conn, b, logger, listenerName)
+    }
+}
+
+func handleConn(client net.Conn, b balancer.Balancer, logger *slog.Logger, listenerName string) {
+    start := time.Now()
+    defer client.Close()
+
+    backend, err := b.Pick()
+    if err != nil {
+        metrics.RequestsTotal.WithLabelValues(listenerName, "error").Inc()
+        return
+    }
+    backend.IncActiveConns()
+    defer backend.DecActiveConns()
+
+    upstream, err := net.DialTimeout("tcp", backend.Addr, 5*time.Second)
+    if err != nil {
+        metrics.RequestsTotal.WithLabelValues(listenerName, "error").Inc()
+        return
+    }
+    defer upstream.Close()
+
+    // ...unchanged io.Copy pair + wg.Wait()...
+
+    metrics.RequestsTotal.WithLabelValues(listenerName, "ok").Inc()
+    metrics.RequestDuration.WithLabelValues(listenerName).Observe(time.Since(start).Seconds())
+    logger.Info("l4 connection served", "listener", listenerName, "backend", backend.Addr, "duration_ms", time.Since(start).Milliseconds())
+}
+```
+
+### Step 6 — wire it into the L7 path (`internal/proxy/l7.go`)
+
+`ReverseProxy` doesn't expose response status/timing to its `Rewrite` hook, so wrap the returned `http.Handler` in a small middleware that captures both — `ModifyResponse` is the other option, but a wrapping `ResponseWriter` also covers the `Pick()`-failure path where `ErrorHandler` writes the response directly, so it's the one place that sees every outcome:
+
+```go
+type statusWriter struct {
+    http.ResponseWriter
+    status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+    w.status = code
+    w.ResponseWriter.WriteHeader(code)
+}
+
+func NewL7Handler(b balancer.Balancer, logger *slog.Logger, listenerName string) http.Handler {
+    rp := &httputil.ReverseProxy{ /* ...unchanged Rewrite/Transport/ErrorHandler... */ }
+
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        sw := &statusWriter{ResponseWriter: w, status: http.StatusOK} // WriteHeader(200) is implicit if never called
+        rp.ServeHTTP(sw, r)
+
+        status := strconv.Itoa(sw.status)
+        metrics.RequestsTotal.WithLabelValues(listenerName, status).Inc()
+        metrics.RequestDuration.WithLabelValues(listenerName).Observe(time.Since(start).Seconds())
+        logger.Info("l7 request served", "listener", listenerName, "status", sw.status, "duration_ms", time.Since(start).Milliseconds())
+    })
+}
+```
+
+### Step 7 — reload logging + counter (`cmd/gobalance/main.go`)
+
+The `reload` closure already distinguishes success/failure — that's exactly the `ReloadsTotal` label:
+
+```go
+reload := func() {
+    if err := store.Reload(*configPath); err != nil {
+        metrics.ReloadsTotal.WithLabelValues("failure").Inc()
+        logger.Warn("reload failed, keeping old config", "error", err)
+        return
+    }
+    metrics.ReloadsTotal.WithLabelValues("success").Inc()
+    logger.Info("reload applied")
+    applyConfig(store.Get(), pools, started)
+}
+```
+
+### Step 8 — assemble in `main.go`
+
+- Build `logger := logging.New()` once, near the top of `main`.
+- Pass `logger` into each `TCPChecker`/`HTTPChecker` literal in `startListener`, and pass `logger, l.Name` into `proxy.ServeL4(...)` / `proxy.NewL7Handler(...)`.
+- After the `pools` map is built, register the backend collector once: `prometheus.MustRegister(&metrics.BackendCollector{Pools: pools})`.
+- Start a metrics server on its own port, in its own goroutine, separate from the L4/L7 listeners — a `-metrics-addr` flag defaulting to `:9100` is enough:
+  ```go
+  go func() {
+      if err := http.ListenAndServe(*metricsAddr, promhttp.Handler()); err != nil {
+          logger.Error("metrics server stopped", "error", err)
+      }
+  }()
+  ```
+
+**Checkpoint:** `curl localhost:9100/metrics` shows `gobalance_requests_total`, `gobalance_backend_active_connections`, and `gobalance_backend_healthy` moving as you `curl` the L7 listener and kill/restart a backend. Trigger a reload (`kill -HUP` or edit the config) and confirm `gobalance_reloads_total{result="success"}` increments and a JSON log line appears. Bonus: spin up a local Prometheus + Grafana via docker-compose and build one dashboard panel showing per-backend request rate — a screenshot of this is strong portfolio material.
 
 ---
 

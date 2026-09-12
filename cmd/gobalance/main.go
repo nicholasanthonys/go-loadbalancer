@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,16 +15,23 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/nicholasanthonys/gobalance/internal/balancer"
 	"github.com/nicholasanthonys/gobalance/internal/config"
 	"github.com/nicholasanthonys/gobalance/internal/healthcheck"
+	"github.com/nicholasanthonys/gobalance/internal/logging"
+	"github.com/nicholasanthonys/gobalance/internal/metrics"
 	"github.com/nicholasanthonys/gobalance/internal/pool"
 	"github.com/nicholasanthonys/gobalance/internal/proxy"
 )
 
+var metricsAddr = flag.String("metrics-addr", ":9100", "address for the /metrics endpoint")
+
 func main() {
 	fmt.Println("gobalance starting...")
+	logger := logging.New()
 	var enableTLS = flag.Bool("tls", true, "terminate TLS at both listeners")
 	var configPath = flag.String("config", "configs/example.yaml", "path to config file")
 	flag.Parse()
@@ -63,9 +71,12 @@ func main() {
 
 	reload := func() {
 		if err := store.Reload(*configPath); err != nil {
-			log.Printf("reload: bad config, keeping old one: %v", err)
+			metrics.ReloadsTotal.WithLabelValues("failure").Inc()
+			logger.Warn("reload failed, keeping old config", "error", err)
 			return
 		}
+		metrics.ReloadsTotal.WithLabelValues("success").Inc()
+		logger.Info("reload applied")
 		applyConfig(store.Get(), pools, started)
 	}
 
@@ -73,11 +84,18 @@ func main() {
 		p := pools[l.Name]
 		go func() {
 			fmt.Printf("listener %q (%s) starting on %s\n", l.Name, l.Type, l.Listen)
-			if err := startListener(l, p, tlsConfig); err != nil {
+			if err := startListener(l, p, tlsConfig, logger); err != nil {
 				fmt.Printf("listener %q stopped: %v\n", l.Name, err)
 			}
 		}()
 	}
+
+	prometheus.MustRegister(&metrics.BackendCollector{Pools: pools})
+	go func() {
+		if err := http.ListenAndServe(*metricsAddr, promhttp.Handler()); err != nil {
+			logger.Error("metrics server stopped", "error", err)
+		}
+	}()
 
 	// Reload trigger 1: SIGHUP. `kill -HUP <pid>` re-reads the config file.
 	sigCh := make(chan os.Signal, 1)
@@ -174,7 +192,7 @@ func buildPool(l config.Listener) *pool.Pool {
 // config.Listener around an already-built *pool.Pool, then starts serving
 // it. It blocks for as long as the listener is running and returns the
 // error that stopped it.
-func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config) error {
+func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logger *slog.Logger) error {
 	bal, err := balancer.New(l.Algorithm, p)
 	if err != nil {
 		return fmt.Errorf("listener %q: %w", l.Name, err)
@@ -188,10 +206,11 @@ func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config) error
 			Timeout:        l.HealthCheck.Timeout.Duration,
 			UnhealthyTresh: l.HealthCheck.UnhealthyThreshold,
 			HealthyThresh:  l.HealthCheck.HealthyThreshold,
+			Logger:         logger,
 		}
 		go check.Run(context.Background())
 
-		return proxy.ServeL4(l.Listen, bal, tlsConfig)
+		return proxy.ServeL4(l.Listen, bal, tlsConfig, logger, l.Name)
 
 	case "l7":
 		check := &healthcheck.HTTPChecker{
@@ -207,7 +226,7 @@ func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config) error
 		}
 		go check.Run(context.Background())
 
-		handler := proxy.NewL7Handler(bal)
+		handler := proxy.NewL7Handler(bal, logger, l.Name)
 		if tlsConfig != nil {
 			return http.ListenAndServeTLS(l.Listen, "certs/cert.pem", "certs/key.pem", handler)
 		}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nicholasanthonys/gobalance/internal/balancer"
+	"github.com/nicholasanthonys/gobalance/internal/logging"
 	"github.com/nicholasanthonys/gobalance/internal/pool"
 	"github.com/nicholasanthonys/gobalance/internal/proxy"
 )
@@ -54,7 +55,7 @@ func TestHotReloadDuringTraffic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lb := httptest.NewServer(proxy.NewL7Handler(bal))
+	lb := httptest.NewServer(proxy.NewL7Handler(bal, logging.New(), "test-lb"))
 	t.Cleanup(lb.Close)
 
 	var (

@@ -3,14 +3,16 @@ package proxy
 import (
 	"crypto/tls"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/nicholasanthonys/gobalance/internal/balancer"
+	"github.com/nicholasanthonys/gobalance/internal/metrics"
 )
 
-func ServeL4(listenAddr string, b balancer.Balancer, tlsConfig *tls.Config) error {
+func ServeL4(listenAddr string, b balancer.Balancer, tlsConfig *tls.Config, logger *slog.Logger, listenerName string) error {
 	var ln net.Listener
 	var err error
 	// open a TCP listener to accept incoming connections on the specified address
@@ -29,14 +31,17 @@ func ServeL4(listenAddr string, b balancer.Balancer, tlsConfig *tls.Config) erro
 		if err != nil {
 			continue // log and keep serving
 		}
-		go handleConn(conn, b)
+		go handleConn(conn, b, logger, listenerName)
 	}
 }
 
-func handleConn(client net.Conn, b balancer.Balancer) {
+func handleConn(client net.Conn, b balancer.Balancer, logger *slog.Logger, listenerName string) {
+
+	start := time.Now()
 	defer client.Close()
 	backend, err := b.Pick()
 	if err != nil {
+		metrics.RequestsTotal.WithLabelValues(listenerName, "error").Inc()
 		return
 	}
 	backend.IncActiveConns()
@@ -44,6 +49,7 @@ func handleConn(client net.Conn, b balancer.Balancer) {
 
 	upstream, err := net.DialTimeout("tcp", backend.Addr, 5*time.Second)
 	if err != nil {
+		metrics.RequestsTotal.WithLabelValues(listenerName, "error").Inc()
 		return
 	}
 	defer upstream.Close()
@@ -59,4 +65,8 @@ func handleConn(client net.Conn, b balancer.Balancer) {
 		io.Copy(client, upstream)
 	}()
 	wg.Wait()
+
+	metrics.RequestsTotal.WithLabelValues(listenerName, "ok").Inc()
+	metrics.RequestDuration.WithLabelValues(listenerName).Observe(time.Since(start).Seconds())
+	logger.Info("l4 connection served", "listener", listenerName, "backend", backend.Addr, "duration_ms", time.Since(start).Milliseconds())
 }

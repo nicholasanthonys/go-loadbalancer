@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"time"
 
@@ -14,6 +15,7 @@ type TCPChecker struct {
 	Timeout        time.Duration
 	UnhealthyTresh int
 	HealthyThresh  int
+	Logger         *slog.Logger
 }
 
 func (c *TCPChecker) Run(ctx context.Context) {
@@ -33,11 +35,17 @@ func (c *TCPChecker) Run(ctx context.Context) {
 }
 
 func (c *TCPChecker) checkOne(b *pool.Backend) {
+	before := b.IsHealthy()
+
 	conn, err := net.DialTimeout("tcp", b.Addr, c.Timeout)
 	if err != nil {
 		b.RecordFailure(c.UnhealthyTresh)
-		return
+	} else {
+		conn.Close()
+		b.RecordSuccess(c.HealthyThresh)
 	}
-	defer conn.Close()
-	b.RecordSuccess(c.HealthyThresh)
+
+	if after := b.IsHealthy(); after != before {
+		c.Logger.Info("backend health changed", "backend", b.Addr, "healthy", after)
+	}
 }

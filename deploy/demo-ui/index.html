@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GoBalance — Live Traffic</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --border: #2a3450;
+    --text: #e8ecf7;
+    --muted: #8b93a8;
+    --accent: #5b8cff;
+    --up: #22c55e;
+    --down: #ef4444;
+    --unknown: #565f78;
+  }
+* { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 24px 16px 48px;
+  }
+  header { max-width: 960px; margin: 0 auto 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0; font-size: 14px; }
+
+  .panel {
+    max-width: 960px;
+    margin: 0 auto 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; font-size: 13px; }
+  .controls label { color: var(--muted); margin-right: 6px; }
+  .controls input, .controls select {
+    background: #0d1220; border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 5px 8px; font-size: 13px;
+  }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button:active { transform: translateY(1px); }
+
+  .status-line { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: var(--unknown); }
+  .status-dot.ok { background: var(--up); }
+  .status-dot.bad { background: var(--down); }
+
+  #stage {
+    max-width: 960px;
+    margin: 0 auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 30px 20px;
+    position: relative;
+    min-height: 340px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    overflow: hidden;
+  }
+
+  .node {
+    background: #0d1220;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+    z-index: 2;
+  }
+  .node .label { font-size: 13px; font-weight: 600; }
+  .node .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  #client-node { width: 110px; }
+  #gobalance-node { width: 150px; border-color: var(--accent); }
+  #gobalance-node .label { color: var(--accent); }
+
+  #backends-col { display: flex; flex-direction: column; gap: 14px; }
+  .backend-card {
+    width: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .backend-card .addr { font-size: 13px; font-weight: 600; }
+  .backend-card .count { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .pill {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.03em;
+    padding: 3px 8px; border-radius: 999px; text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .pill.up { background: rgba(34,197,94,0.15); color: var(--up); }
+  .pill.down { background: rgba(239,68,68,0.15); color: var(--down); }
+  .pill.unknown { background: rgba(86,95,120,0.2); color: var(--unknown); }
+  .backend-card.down { opacity: 0.55; }
+
+  .dot {
+    position: absolute;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    z-index: 1;
+    pointer-events: none;
+    transition: left 480ms linear, top 480ms linear, opacity 480ms linear;
+    opacity: 0.95;
+  }
+  .dot.err { background: var(--down); box-shadow: 0 0 8px var(--down); }
+
+  footer.explain {
+    max-width: 960px; margin: 16px auto 0; font-size: 13px; color: var(--muted); line-height: 1.5;
+  }
+  footer.explain b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GoBalance — Live Traffic</h1>
+  <p class="sub">Watch requests get routed across backends in real time, and see a dead backend get cut out of rotation.</p>
+</header>
+
+<div class="panel">
+  <div class="controls">
+    <span>
+      <label for="metrics-url">Metrics URL</label>
+      <input id="metrics-url" size="28" value="http://localhost:9100/metrics" />
+    </span>
+    <span>
+      <label for="listener-select">Listener</label>
+      <select id="listener-select"><option>discovering…</option></select>
+    </span>
+    <span>
+      <label for="traffic-url">Traffic URL</label>
+      <input id="traffic-url" size="24" value="http://localhost:8080/" />
+    </span>
+    <button id="traffic-toggle">Generate traffic</button>
+    <button id="burst-btn" class="secondary">Send burst (20)</button>
+  </div>
+  <div class="status-line">
+    <span class="status-dot" id="conn-dot"></span><span id="conn-text">connecting to gobalance…</span>
+  </div>
+</div>
+
+<div id="stage">
+  <div class="node" id="client-node">
+    <div class="label">Clients</div>
+    <div class="sub" id="client-sub">0 requests</div>
+  </div>
+  <div class="node" id="gobalance-node">
+    <div class="label">GoBalance</div>
+    <div class="sub" id="listener-sub">—</div>
+  </div>
+  <div id="backends-col"></div>
+</div>
+
+<footer class="explain">
+  Each pulse is a real request GoBalance just routed to that backend. The counts update from
+  GoBalance's own <code>/metrics</code> endpoint — nothing here is simulated. Kill a backend
+  container (or its process) and, within a couple of health-check intervals, its card turns red
+  and traffic stops flowing to it; bring it back and it rejoins once it passes its health checks
+  again.
+</footer>
+
+<script>
+(() => {
+  const metricsUrlInput = document.getElementById('metrics-url');
+  const listenerSelect = document.getElementById('listener-select');
+  const trafficUrlInput = document.getElementById('traffic-url');
+  const trafficToggleBtn = document.getElementById('traffic-toggle');
+  const burstBtn = document.getElementById('burst-btn');
+  const connDot = document.getElementById('conn-dot');
+  const connText = document.getElementById('conn-text');
+  const stage = document.getElementById('stage');
+  const clientNode = document.getElementById('client-node');
+  const clientSub = document.getElementById('client-sub');
+  const gobalanceNode = document.getElementById('gobalance-node');
+  const listenerSub = document.getElementById('listener-sub');
+  const backendsCol = document.getElementById('backends-col');
+
+  const POLL_MS = 400;
+  let lastCounts = {};       // "listener|backend" -> last seen request count
+  let selectedListener = null;
+  let knownListeners = [];
+  let totalClientRequests = 0;
+  let trafficTimer = null;
+
+  // /metrics only knows listener names and backend addresses, not which host
+  // port docker-compose maps a listener to — that mapping lives in
+  // deploy/docker-compose.yaml, not in anything gobalance exposes. So this
+  // has to be a fixed lookup matching that file, not something discovered
+  // live; edit it here if you change the compose port mappings. The field
+  // stays a free-text input so it can still be overridden by hand.
+  const listenerTrafficDefaults = {
+    'l4-demo': 'http://localhost:9090/',
+    'l7-demo': 'http://localhost:8080/',
+  };
+
+  function syncTrafficUrl() {
+    const def = listenerTrafficDefaults[selectedListener];
+    if (def) trafficUrlInput.value = def;
+  }
+
+  function parsePrometheusText(text) {
+    const out = [];
+    for (const line of text.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+([0-9eE.+\-]+)/);
+      if (!m) continue;
+      const [, name, labelStr, valueStr] = m;
+      const labels = {};
+      labelStr.split(',').forEach(pair => {
+        const eq = pair.indexOf('=');
+        if (eq === -1) return;
+        const k = pair.slice(0, eq).trim();
+        const v = pair.slice(eq + 1).trim().replace(/^"|"$/g, '');
+        labels[k] = v;
+      });
+      out.push({ name, labels, value: parseFloat(valueStr) });
+    }
+    return out;
+  }
+
+  function setConn(ok, msg) {
+    connDot.className = 'status-dot ' + (ok ? 'ok' : 'bad');
+    connText.textContent = msg;
+  }
+
+  function ensureBackendCards(backends) {
+    // backends: [{addr, healthy, count}], stable order
+    const existing = new Map([...backendsCol.children].map(el => [el.dataset.addr, el]));
+    const seen = new Set();
+    backends.forEach(b => {
+      seen.add(b.addr);
+      let card = existing.get(b.addr);
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'node backend-card';
+        card.dataset.addr = b.addr;
+        card.innerHTML = `
+          <div>
+            <div class="addr"></div>
+            <div class="count"></div>
+          </div>
+          <div class="pill"></div>`;
+        backendsCol.appendChild(card);
+      }
+      card.querySelector('.addr').textContent = b.addr;
+      card.querySelector('.count').textContent = b.count + ' requests';
+      const pill = card.querySelector('.pill');
+      if (b.healthy === true) {
+        pill.textContent = 'Up'; pill.className = 'pill up';
+        card.classList.remove('down');
+      } else if (b.healthy === false) {
+        pill.textContent = 'Down'; pill.className = 'pill down';
+        card.classList.add('down');
+      } else {
+        pill.textContent = '?'; pill.className = 'pill unknown';
+        card.classList.remove('down');
+      }
+    });
+    for (const [addr, el] of existing) {
+      if (!seen.has(addr)) el.remove();
+    }
+  }
+
+  function spawnDots(fromEl, toEl, count, isErr) {
+    const stageBox = stage.getBoundingClientRect();
+    const from = fromEl.getBoundingClientRect();
+    const to = toEl.getBoundingClientRect();
+    const fx = from.left + from.width / 2 - stageBox.left;
+    const fy = from.top + from.height / 2 - stageBox.top;
+    const tx = to.left + to.width / 2 - stageBox.left;
+    const ty = to.top + to.height / 2 - stageBox.top;
+    const n = Math.max(1, Math.min(count, 6));
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => {
+        const dot = document.createElement('div');
+        dot.className = 'dot' + (isErr ? ' err' : '');
+        dot.style.left = fx + 'px';
+        dot.style.top = fy + 'px';
+        stage.appendChild(dot);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          dot.style.left = tx + 'px';
+          dot.style.top = ty + 'px';
+        }));
+        setTimeout(() => { dot.style.opacity = '0'; }, 420);
+        setTimeout(() => dot.remove(), 620);
+      }, i * 70);
+    }
+  }
+
+  async function poll() {
+    const url = metricsUrlInput.value.trim();
+    let text;
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      text = await res.text();
+      setConn(true, 'connected to ' + url);
+    } catch (e) {
+      setConn(false, 'cannot reach ' + url + ' (' + e.message + ')');
+      return;
+    }
+
+    const metrics = parsePrometheusText(text);
+    const reqTotals = metrics.filter(m => m.name === 'gobalance_backend_requests_total');
+    const healthy = metrics.filter(m => m.name === 'gobalance_backend_healthy');
+
+    // Union of both metrics: gobalance_backend_requests_total only gains a
+    // label combination once a listener has served at least one request,
+    // but gobalance_backend_healthy is collected live for every pool
+    // regardless of traffic — without it, an idle listener never appears.
+    knownListeners = [...new Set([
+      ...reqTotals.map(m => m.labels.listener),
+      ...healthy.map(m => m.labels.listener),
+    ])].sort();
+    if (knownListeners.length && !knownListeners.includes(selectedListener)) {
+      selectedListener = knownListeners[0];
+      syncTrafficUrl();
+    }
+    if (listenerSelect.dataset.rendered !== knownListeners.join(',')) {
+      listenerSelect.innerHTML = knownListeners.map(l =>
+        `<option value="${l}"${l === selectedListener ? ' selected' : ''}>${l}</option>`).join('');
+      listenerSelect.dataset.rendered = knownListeners.join(',');
+    }
+    listenerSub.textContent = selectedListener || 'no listeners yet';
+
+    const healthMap = {};
+    healthy.forEach(m => {
+      if (m.labels.listener !== selectedListener) return;
+      healthMap[m.labels.backend] = m.value === 1;
+    });
+    const countMap = {};
+    reqTotals.forEach(m => {
+      if (m.labels.listener !== selectedListener) return;
+      countMap[m.labels.backend] = m.value;
+    });
+
+    // Union again: a backend with zero requests so far still has a health
+    // entry and should still get a card (just showing "0 requests").
+    const backendAddrs = [...new Set([...Object.keys(healthMap), ...Object.keys(countMap)])];
+    const backends = backendAddrs
+      .map(addr => ({ addr, count: countMap[addr] || 0, healthy: healthMap[addr] }))
+      .sort((a, b) => a.addr.localeCompare(b.addr));
+
+    ensureBackendCards(backends);
+
+    backends.forEach(b => {
+      const key = selectedListener + '|' + b.addr;
+      const prev = lastCounts[key];
+      if (prev !== undefined && b.count > prev) {
+        const delta = b.count - prev;
+        totalClientRequests += delta;
+        const card = [...backendsCol.children].find(el => el.dataset.addr === b.addr);
+        if (card) spawnDots(gobalanceNode, card, delta, b.healthy === false);
+        spawnDots(clientNode, gobalanceNode, delta, false);
+      }
+      lastCounts[key] = b.count;
+    });
+    clientSub.textContent = totalClientRequests + ' requests';
+  }
+
+  listenerSelect.addEventListener('change', () => {
+    selectedListener = listenerSelect.value;
+    lastCounts = {};
+    syncTrafficUrl();
+  });
+
+  function fireTraffic() {
+    const url = trafficUrlInput.value.trim();
+    // WebSocket, not fetch: browsers pool/reuse keep-alive HTTP connections
+    // per host:port, so repeated fetch() calls often ride the SAME TCP
+    // connection. That's invisible to L7 (it picks a backend per HTTP
+    // request even on a reused connection) but breaks L4, which only picks
+    // a backend once, when a connection is first accepted — a reused
+    // connection never triggers a second pick. Browsers never pool
+    // WebSockets, so each one is a genuinely fresh TCP connection, same as
+    // a fresh `curl` process. The handshake doesn't need to succeed: gobalance
+    // picks a backend and bumps its counter the instant the connection is
+    // accepted, before it looks at any bytes.
+    try {
+      const ws = new WebSocket(url.replace(/^http/, 'ws'));
+      ws.onopen = () => ws.close();
+      ws.onerror = () => {};
+    } catch (e) {}
+  }
+
+  trafficToggleBtn.addEventListener('click', () => {
+    if (trafficTimer) {
+      clearInterval(trafficTimer);
+      trafficTimer = null;
+      trafficToggleBtn.textContent = 'Generate traffic';
+    } else {
+      trafficTimer = setInterval(fireTraffic, 150);
+      trafficToggleBtn.textContent = 'Stop traffic';
+    }
+  });
+
+  burstBtn.addEventListener('click', () => {
+    for (let i = 0; i < 20; i++) setTimeout(fireTraffic, i * 40);
+  });
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+
+</body>
+</html>

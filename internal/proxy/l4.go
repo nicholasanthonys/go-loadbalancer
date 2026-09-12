@@ -107,6 +107,7 @@ func (s *L4Server) handleConn(client net.Conn) {
 	}
 	backend.IncActiveConns()
 	defer backend.DecActiveConns()
+	metrics.BackendRequestsTotal.WithLabelValues(s.ListenerName, backend.Addr).Inc()
 
 	upstream, err := net.DialTimeout("tcp", backend.Addr, 5*time.Second)
 	if err != nil {

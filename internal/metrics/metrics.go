@@ -20,8 +20,16 @@ var (
 		prometheus.CounterOpts{Name: "gobalance_reloads_total", Help: "Config reload attempts, by result."},
 		[]string{"result"}, // "success" or "failure"
 	)
+
+	BackendRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gobalance_backend_requests_total",
+			Help: "Total requests routed to each backend, by listener and backend address.",
+		},
+		[]string{"listener", "backend"},
+	)
 )
 
 func init() {
-	prometheus.MustRegister(RequestsTotal, RequestDuration, ReloadsTotal)
+	prometheus.MustRegister(RequestsTotal, RequestDuration, ReloadsTotal, BackendRequestsTotal)
 }

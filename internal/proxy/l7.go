@@ -39,6 +39,7 @@ func NewL7Handler(b balancer.Balancer, logger *slog.Logger, listenerName string)
 				Host:   backend.Addr,
 			})
 			r.SetXForwarded()
+			metrics.BackendRequestsTotal.WithLabelValues(listenerName, backend.Addr).Inc()
 		},
 		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			if err, ok := req.Context().Value(pickErrKey{}).(error); ok {

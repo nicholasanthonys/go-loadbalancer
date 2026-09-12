@@ -104,7 +104,15 @@ func main() {
 	}
 
 	prometheus.MustRegister(&metrics.BackendCollector{Pools: pools})
-	metricsSrv := &http.Server{Addr: *metricsAddr, Handler: promhttp.Handler()}
+	metricsHandler := promhttp.Handler()
+	// CORS: /metrics carries nothing sensitive (backend addresses, request
+	// counts), and letting a browser-based dashboard fetch it directly avoids
+	// standing up a separate backend just to relay it.
+	corsMetricsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		metricsHandler.ServeHTTP(w, r)
+	})
+	metricsSrv := &http.Server{Addr: *metricsAddr, Handler: corsMetricsHandler}
 	go func() {
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server stopped", "error", err)

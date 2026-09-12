@@ -42,9 +42,16 @@ Currently implemented:
   config keeps serving. Backend list and weight changes apply live without dropping in-flight
   connections (surviving backends keep their health state). Changing a listener's algorithm or type,
   or adding/removing listeners, still needs a restart — those are logged and ignored on reload.
+- **Structured logging + metrics** ([`internal/logging`](internal/logging),
+  [`internal/metrics`](internal/metrics)) — `slog`-based request/reload/health-transition logging;
+  Prometheus counters/histograms (`gobalance_requests_total`, `gobalance_request_duration_seconds`,
+  `gobalance_reloads_total`) plus live per-backend gauges served on `:9100/metrics`.
+- **Graceful shutdown** ([`internal/proxy/l4.go`](internal/proxy/l4.go)) — `SIGTERM`/`SIGINT` stops
+  new connections and drains in-flight ones (bounded by `-shutdown-timeout`, default 30s) across all
+  listeners concurrently before exiting.
 
-Not yet implemented: metrics/logging, graceful shutdown, and the Docker Compose demo. See
-[`docs/TUTORIAL.md`](docs/TUTORIAL.md)'s progress table for exact phase-by-phase status.
+Not yet implemented: the Docker Compose demo (Phase 10). See [`docs/TUTORIAL.md`](docs/TUTORIAL.md)'s
+progress table for exact phase-by-phase status.
 
 ## Running it
 
@@ -86,8 +93,8 @@ go run ./cmd/gobalance
 
 This reads [`configs/example.yaml`](configs/example.yaml) by default (override with `-config
 path/to/file.yaml`) and starts an L4 listener on `localhost:9090` and an L7 listener on `:9091`,
-both round-robining across the three backends above. Health checks run on a 5s interval and need 2
-consecutive successes before a backend is used — allow ~10s after starting backends before traffic
+both round-robining across the three backends above. Health checks run on a 1s interval and need 2
+consecutive successes before a backend is used — allow ~3s after starting backends before traffic
 stops getting `503 no healthy backends available`.
 
 Send it traffic (TLS is on by default, hence `-k` to skip self-signed-cert verification; add
@@ -131,3 +138,43 @@ go test -race ./...
 `-race` is treated as a hard requirement, not a nice-to-have — the pool's health state and
 active-connection counts are read and written concurrently by the proxy loop and the health checker,
 and that's exactly the kind of thing the race detector exists to catch.
+
+## Load testing
+
+`scripts/loadtest.sh` runs three scenarios against a `-race` build of gobalance, via
+[`vegeta`](https://github.com/tsenart/vegeta) (`go install github.com/tsenart/vegeta@latest`):
+
+- **Baseline** — steady traffic against healthy backends, nothing else happening. Answers "how fast
+  is gobalance": this is the number that maps to the PRD's throughput/latency target.
+- **Reload under load** — traffic keeps flowing while `SIGHUP` triggers a live config reload
+  mid-attack. Answers "does an in-flight request ever get dropped just because the config changed."
+- **Failure injection** — traffic keeps flowing while one backend process is killed outright.
+  Answers "how much damage does a real backend crash do before the health checker routes around it."
+
+```bash
+scripts/loadtest.sh [rate] [duration]   # defaults: 2000 req/s, 30s
+```
+
+Latest results (2,000 req/s, 15s, against `configs/example.yaml`'s 3-backend demo):
+
+| Scenario | Success | p50 | p99 |
+|---|---|---|---|
+| Baseline | 100.00% | 0.54ms | 1.37ms |
+| Reload under load | 100.00% | 0.61ms | 1.54ms |
+| Backend killed mid-load | 96.75% (650/20000 failed) | 0.55ms | 1.08ms |
+
+p99 latency stays well under the PRD's 5ms budget, reload drops zero connections, and a killed
+backend causes ~2 seconds of partial impact (matching `unhealthy_threshold: 2` × `interval: 1s`,
+with round robin routing roughly 1/3 of traffic to the dead backend during that window) before
+recovering cleanly.
+
+Two dead ends worth knowing about if you re-run this and see garbage numbers — both are artifacts of
+the *dummy backends*, not gobalance:
+
+- Plain `python3 -m http.server` doesn't support HTTP keep-alive, so at load it forces a new TCP
+  connection (and ephemeral port) per request; past a few thousand req/s that exhausts the local port
+  range and produces multi-second latencies that look like a proxy problem but aren't.
+- A naive keep-alive fix re-introduces a different artifact: a flat ~40ms floor on every request,
+  the classic Nagle's-algorithm + delayed-ACK interaction (small header/body writes on a
+  non-`TCP_NODELAY` socket). `scripts/loadtest.sh`'s dummy backend sets `TCP_NODELAY` explicitly to
+  avoid it.

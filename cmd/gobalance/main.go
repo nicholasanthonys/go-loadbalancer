@@ -223,6 +223,7 @@ func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logge
 			Path:           l.HealthCheck.Path,
 			ExpectedStatus: http.StatusOK,
 			HTTPClient:     &http.Client{},
+			Logger:         logger,
 		}
 		go check.Run(context.Background())
 

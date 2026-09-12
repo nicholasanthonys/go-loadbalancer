@@ -2,6 +2,7 @@ package healthcheck
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
@@ -18,6 +19,7 @@ type HTTPChecker struct {
 	Timeout        time.Duration
 	UnhealthyTresh int
 	HealthyThresh  int
+	Logger         *slog.Logger
 }
 
 func (c *HTTPChecker) Run(ctx context.Context) {
@@ -36,6 +38,13 @@ func (c *HTTPChecker) Run(ctx context.Context) {
 }
 
 func (c *HTTPChecker) checkOne(b *pool.Backend) {
+	before := b.IsHealthy()
+	defer func() {
+		if after := b.IsHealthy(); after != before {
+			c.Logger.Info("backend health changed", "backend", b.Addr, "healthy", after)
+		}
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
 	defer cancel()
 

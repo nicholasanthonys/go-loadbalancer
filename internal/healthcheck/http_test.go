@@ -1,6 +1,7 @@
 package healthcheck
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -29,6 +30,7 @@ func TestHTTPChecker_HysteresisFlipsAtThreshold(t *testing.T) {
 		Timeout:        time.Second,
 		UnhealthyTresh: 3,
 		HealthyThresh:  2,
+		Logger:         slog.New(slog.DiscardHandler),
 	}
 
 	statusCode.Store(http.StatusInternalServerError)

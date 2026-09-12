@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,11 +30,19 @@ import (
 
 var metricsAddr = flag.String("metrics-addr", ":9100", "address for the /metrics endpoint")
 
+// shutdownableServer is satisfied by both *http.Server (L7 listeners, the
+// metrics server) and *proxy.L4Server (L4 listeners) so main can drain every
+// listener the same way on SIGTERM/SIGINT.
+type shutdownableServer interface {
+	Shutdown(ctx context.Context) error
+}
+
 func main() {
 	fmt.Println("gobalance starting...")
 	logger := logging.New()
 	var enableTLS = flag.Bool("tls", true, "terminate TLS at both listeners")
 	var configPath = flag.String("config", "configs/example.yaml", "path to config file")
+	var shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "max time to wait for in-flight connections to drain on shutdown")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -80,22 +89,28 @@ func main() {
 		applyConfig(store.Get(), pools, started)
 	}
 
+	// servers holds every listener's shutdown handle so a SIGTERM/SIGINT can
+	// drain all of them together at the end of main.
+	var servers []shutdownableServer
 	for _, l := range store.Get().Listeners {
 		p := pools[l.Name]
-		go func() {
-			fmt.Printf("listener %q (%s) starting on %s\n", l.Name, l.Type, l.Listen)
-			if err := startListener(l, p, tlsConfig, logger); err != nil {
-				fmt.Printf("listener %q stopped: %v\n", l.Name, err)
-			}
-		}()
+		fmt.Printf("listener %q (%s) starting on %s\n", l.Name, l.Type, l.Listen)
+		srv, err := startListener(l, p, tlsConfig, logger)
+		if err != nil {
+			fmt.Printf("listener %q failed to start: %v\n", l.Name, err)
+			continue
+		}
+		servers = append(servers, srv)
 	}
 
 	prometheus.MustRegister(&metrics.BackendCollector{Pools: pools})
+	metricsSrv := &http.Server{Addr: *metricsAddr, Handler: promhttp.Handler()}
 	go func() {
-		if err := http.ListenAndServe(*metricsAddr, promhttp.Handler()); err != nil {
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server stopped", "error", err)
 		}
 	}()
+	servers = append(servers, metricsSrv)
 
 	// Reload trigger 1: SIGHUP. `kill -HUP <pid>` re-reads the config file.
 	sigCh := make(chan os.Signal, 1)
@@ -147,7 +162,26 @@ func main() {
 		}()
 	}
 
-	select {} // keep main alive; real graceful shutdown comes in Phase 8
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+	<-shutdownCh
+	logger.Info("shutdown signal received, draining", "timeout", shutdownTimeout.String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := srv.Shutdown(ctx); err != nil {
+				logger.Warn("listener did not shut down cleanly", "error", err)
+			}
+		}()
+	}
+	wg.Wait()
+	logger.Info("shutdown complete")
 }
 
 // applyConfig takes a freshly-reloaded config and pushes whatever changes
@@ -189,13 +223,15 @@ func buildPool(l config.Listener) *pool.Pool {
 }
 
 // startListener wires up the balancer and health-checker for a single
-// config.Listener around an already-built *pool.Pool, then starts serving
-// it. It blocks for as long as the listener is running and returns the
-// error that stopped it.
-func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logger *slog.Logger) error {
+// config.Listener around an already-built *pool.Pool, starts serving it in
+// the background, and returns a handle main can call Shutdown on. Only
+// startup errors (bad algorithm, unknown listener type) are returned
+// synchronously; errors that occur once serving is underway are logged from
+// inside the background goroutine instead.
+func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logger *slog.Logger) (shutdownableServer, error) {
 	bal, err := balancer.New(l.Algorithm, p)
 	if err != nil {
-		return fmt.Errorf("listener %q: %w", l.Name, err)
+		return nil, fmt.Errorf("listener %q: %w", l.Name, err)
 	}
 
 	switch l.Type {
@@ -210,7 +246,13 @@ func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logge
 		}
 		go check.Run(context.Background())
 
-		return proxy.ServeL4(l.Listen, bal, tlsConfig, logger, l.Name)
+		srv := &proxy.L4Server{Balancer: bal, Logger: logger, ListenerName: l.Name}
+		go func() {
+			if err := srv.ListenAndServe(l.Listen, tlsConfig); err != nil {
+				logger.Error("l4 listener stopped", "listener", l.Name, "error", err)
+			}
+		}()
+		return srv, nil
 
 	case "l7":
 		check := &healthcheck.HTTPChecker{
@@ -228,12 +270,22 @@ func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logge
 		go check.Run(context.Background())
 
 		handler := proxy.NewL7Handler(bal, logger, l.Name)
-		if tlsConfig != nil {
-			return http.ListenAndServeTLS(l.Listen, "certs/cert.pem", "certs/key.pem", handler)
-		}
-		return http.ListenAndServe(l.Listen, handler)
+		srv := &http.Server{Addr: l.Listen, Handler: handler}
+		go func() {
+			var err error
+			if tlsConfig != nil {
+				srv.TLSConfig = tlsConfig
+				err = srv.ListenAndServeTLS("certs/cert.pem", "certs/key.pem")
+			} else {
+				err = srv.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
+				logger.Error("l7 listener stopped", "listener", l.Name, "error", err)
+			}
+		}()
+		return srv, nil
 
 	default:
-		return fmt.Errorf("listener %q: unknown type %q", l.Name, l.Type)
+		return nil, fmt.Errorf("listener %q: unknown type %q", l.Name, l.Type)
 	}
 }

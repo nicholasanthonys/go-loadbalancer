@@ -17,13 +17,13 @@ Prerequisite: Go 1.24+ installed (`go version` to confirm), basic familiarity wi
 | 4 — More Algorithms | Done | `ActiveConns` tracking wired into `l4.go`; all six algorithms implemented — `RoundRobin`, `LeastConn`, `WeightedRoundRobin`, `WeightedLeastConn`, `Random`, `PowerOfTwoChoices`. `round_robin_test.go`, `least_conn_test.go`, `weighted_round_robin_test.go`, `random_test.go`, and `power_of_two_test.go` all pass under `-race`; `weighted_least_conn` has no dedicated test yet. |
 | 5 — HTTP Health Checks + TLS Termination | Done | `internal/healthcheck/http.go` (`HTTPChecker`) mirrors `TCPChecker`'s hysteresis shape via the shared `Checker` interface; `http_test.go` drives the healthy→unhealthy→healthy flip end-to-end against a real `httptest.Server`. TLS termination added to both listeners: `internal/proxy/l4.go` takes an optional `*tls.Config` (`nil` = plaintext); L7 needed no code changes since `http.Server` decrypts transparently below the handler. `main.go`'s `-tls` flag makes plaintext/TLS a real runtime toggle rather than TLS-only. |
 | 6 — Configuration File + Hot Reload | Done | **Config file:** `internal/config/config.go` defines `Config`/`Listener`/`HealthCheck`/`Backend` with `yaml.v3` tags, a custom `Duration` type so fields can be written as `"5s"`, `Load()` with validation, and `configs/example.yaml`. `cmd/gobalance/main.go` builds a pool/balancer/health-checker per listener from the loaded config via `balancer.New(name, pool)`, each on its own goroutine. **Hot reload:** `config.Store` (`atomic.Pointer[Config]`) holds the live config; `Reload()` re-reads + re-validates and swaps only on success, so a bad edit leaves the old config serving. `pool.Pool` has an `RWMutex`-guarded `SetBackends([]BackendSpec)` that reuses the existing `*Backend` for surviving addresses (health/hysteresis/active-conn state carries over) and starts genuinely new addresses unhealthy. `Backend.weight` became an `atomic.Int64` (`Weight()`/`SetWeight()`) since a reload now writes it while the weighted algorithms read it. `main.go` holds a listener-name → `*pool.Pool` registry plus a `started` map of each listener's launch config, and an `applyConfig` that pushes backend-list/weight changes onto the running pools — logging and ignoring algorithm/type changes (those need a restart). Two triggers feed one `reload()` closure: `SIGHUP` and an `fsnotify` watch on the config file's *directory* (editors rename-replace), debounced 200ms. `test/integration/reload_test.go` hammers a live L7 listener with 8 traffic goroutines while a 9th churns the backend set/weights ~300×, asserting zero dropped requests, clean under `-race`. |
-| 7 — Observability: Logging + Metrics | Not started | `internal/metrics/`, `internal/logging/` are empty. |
-| 8 — Graceful Shutdown | Not started | |
+| 7 — Observability: Logging + Metrics | Done | `internal/logging/logging.go` sets up a shared `slog.Logger`; request/reload/health-transition log lines wired through `l4.go`, `l7.go`, `main.go`, and both health checkers. `internal/metrics/metrics.go` defines `RequestsTotal` (listener+status), `RequestDuration` (listener), and `ReloadsTotal` (result) counters/histogram; `internal/metrics/collector.go`'s `BackendCollector` reads live per-backend active-conn and healthy-state off each pool at scrape time rather than caching it, served on `:9100/metrics`. `collector_test.go` covers the metric shapes and confirms state is read live (not cached), passing under `-race`. |
+| 8 — Graceful Shutdown | Done | `internal/proxy/l4.go`'s `L4Server` gains `ListenAndServe`/`Serve`/`Shutdown`, mirroring `net/http.Server`'s shape: `Serve` tracks in-flight connections in a `sync.WaitGroup`, and a `closed` flag tells it a `Shutdown`-triggered `Accept` error apart from a real one. `main.go` wraps L7 and the metrics server in `*http.Server` values, adds a `shutdownableServer` interface so all three listener kinds drain identically, and replaces the old `select{}` with a `SIGTERM`/`SIGINT` handler that waits (bounded by the new `-shutdown-timeout` flag, default 30s) for every listener's `Shutdown` to return — run concurrently so one slow listener can't eat another's share of the timeout. `internal/proxy/l4_test.go`'s `TestL4Server_ShutdownDrainsInFlightConnections` automates the checkpoint scenario, passing under `-race`. |
 | 9 — Race Audit + Load Testing | Not started | |
 | 10 — Containerize and Package for Demo | Not started | `deploy/` is empty. |
 | 11 — Polish for Portfolio | Not started | |
 
-**Pick up here:** Phase 7 — observability. `internal/logging/` (slog setup, request/reload/health-transition log lines) and `internal/metrics/` (Prometheus collectors: request counts/latency per listener, active connections per backend, health-state gauge, reload counter) are both empty. Wire a `/metrics` endpoint and structured logging through the existing listener/health-checker/reload paths.
+**Pick up here:** Phase 9 — race audit + load testing. Run `go test -race ./...` across the whole suite (it should already be clean), then a load test (`vegeta` or `hey`) against the running binary, including a config reload and a backend kill mid-load, and record real throughput/latency/error-rate numbers for the README.
 
 ---
 
@@ -1152,23 +1152,228 @@ reload := func() {
 
 **Goal:** `SIGTERM`/`SIGINT` stops new connections, drains in-flight ones within a timeout, then exits cleanly.
 
+**Concepts:** `http.Server` already has this built in — `Shutdown(ctx)` stops `Accept`ing and waits for in-flight requests, bounded by `ctx`'s deadline. `net.Listener` used directly (L4's raw accept loop) has no such thing, so you build the same shape by hand: close the listener to stop new `Accept`s, and track every in-flight connection in a `sync.WaitGroup` that `Shutdown` waits on. Giving both the same `Shutdown(ctx context.Context) error` method signature means `main` can drain every listener — L4, L7, and the metrics server — the same way, through one small interface, instead of special-casing each type.
+
+### Step 1 — turn the L4 accept loop into a type with a `Shutdown` (`internal/proxy/l4.go`)
+
+The free-standing `ServeL4`/`handleConn` functions become methods on an `L4Server`, so there's a value to call `Shutdown` on:
+
 ```go
-// cmd/gobalance/main.go (snippet)
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-<-sigCh
-logger.Info("shutdown signal received, draining")
+type L4Server struct {
+    Balancer     balancer.Balancer
+    Logger       *slog.Logger
+    ListenerName string
 
-ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer cancel()
-srv.Shutdown(ctx) // L7: stdlib handles draining for you
+    mu     sync.Mutex
+    ln     net.Listener
+    closed bool
+    wg     sync.WaitGroup
+}
 
-// L4: close the listener, then wait on a WaitGroup tracking active handleConn goroutines
-l4Listener.Close()
-waitWithTimeout(activeConnsWG, 30*time.Second)
+// ListenAndServe opens a TCP (or TLS, if tlsConfig is non-nil) listener on
+// addr and runs the accept loop. It blocks until Shutdown closes the
+// listener, at which point it returns nil.
+func (s *L4Server) ListenAndServe(addr string, tlsConfig *tls.Config) error {
+    var ln net.Listener
+    var err error
+    if tlsConfig != nil {
+        ln, err = tls.Listen("tcp", addr, tlsConfig)
+    } else {
+        ln, err = net.Listen("tcp", addr)
+    }
+    if err != nil {
+        return err
+    }
+    return s.Serve(ln)
+}
+
+// Serve runs the accept loop on an already-open listener. It blocks until
+// Shutdown closes the listener, at which point it returns nil.
+func (s *L4Server) Serve(ln net.Listener) error {
+    s.mu.Lock()
+    s.ln = ln
+    s.mu.Unlock()
+
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            s.mu.Lock()
+            closed := s.closed
+            s.mu.Unlock()
+            if closed {
+                return nil // Shutdown closed the listener on purpose
+            }
+            continue // transient accept error; keep serving
+        }
+        s.wg.Add(1)
+        go func() {
+            defer s.wg.Done()
+            s.handleConn(conn)
+        }()
+    }
+}
 ```
 
-**Checkpoint:** start a slow request (backend sleeps 5s), send `SIGTERM` to GoBalance immediately after, and confirm the in-flight request still completes successfully while new connection attempts during the drain window are refused/queued rather than accepted normally.
+`Serve` takes a `net.Listener` rather than an address (mirroring `http.Server.Serve`/`ListenAndServe`) so tests — and anything else that needs the bound address before serving starts, e.g. an ephemeral `:0` port — can create the listener themselves.
+
+### Step 2 — `Shutdown` and the connection handler (`internal/proxy/l4.go`)
+
+```go
+// Shutdown stops accepting new connections and waits for in-flight ones to
+// finish their io.Copy pumps, up to ctx's deadline.
+func (s *L4Server) Shutdown(ctx context.Context) error {
+    s.mu.Lock()
+    s.closed = true
+    ln := s.ln
+    s.mu.Unlock()
+    if ln != nil {
+        ln.Close()
+    }
+
+    done := make(chan struct{})
+    go func() {
+        s.wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+
+func (s *L4Server) handleConn(client net.Conn) {
+    // ...unchanged body from Phase 7, just reading off s.Balancer/s.Logger/
+    // s.ListenerName instead of function parameters...
+}
+```
+
+The `closed` flag is what tells `Serve` an `Accept` error was *caused by* `Shutdown` (so it should return cleanly) rather than a real transient error (so it should keep looping) — closing a listener that's blocked in `Accept` is exactly how you interrupt it in Go; there's no separate cancellation mechanism.
+
+### Step 3 — give L7 and the metrics server the same shape (`cmd/gobalance/main.go`)
+
+Both already run on `net/http`, so instead of calling `http.ListenAndServe(...)` directly (which gives you nothing back to shut down later), construct an `*http.Server` value and keep it:
+
+```go
+handler := proxy.NewL7Handler(bal, logger, l.Name)
+srv := &http.Server{Addr: l.Listen, Handler: handler}
+go func() {
+    var err error
+    if tlsConfig != nil {
+        srv.TLSConfig = tlsConfig
+        err = srv.ListenAndServeTLS("certs/cert.pem", "certs/key.pem")
+    } else {
+        err = srv.ListenAndServe()
+    }
+    if err != nil && err != http.ErrServerClosed {
+        logger.Error("l7 listener stopped", "listener", l.Name, "error", err)
+    }
+}()
+```
+
+`http.ErrServerClosed` is the expected return value once `Shutdown` runs — checking for it keeps a clean shutdown from being logged as an error. Do the same for the metrics server:
+
+```go
+metricsSrv := &http.Server{Addr: *metricsAddr, Handler: promhttp.Handler()}
+go func() {
+    if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+        logger.Error("metrics server stopped", "error", err)
+    }
+}()
+```
+
+### Step 4 — one interface to shut them all down (`cmd/gobalance/main.go`)
+
+```go
+// shutdownableServer is satisfied by both *http.Server (L7 listeners, the
+// metrics server) and *proxy.L4Server (L4 listeners) so main can drain every
+// listener the same way on SIGTERM/SIGINT.
+type shutdownableServer interface {
+    Shutdown(ctx context.Context) error
+}
+```
+
+`startListener` changes from blocking (it used to *be* the accept loop) to starting the server in a background goroutine and returning immediately with a handle:
+
+```go
+func startListener(l config.Listener, p *pool.Pool, tlsConfig *tls.Config, logger *slog.Logger) (shutdownableServer, error) {
+    bal, err := balancer.New(l.Algorithm, p)
+    if err != nil {
+        return nil, fmt.Errorf("listener %q: %w", l.Name, err)
+    }
+
+    switch l.Type {
+    case "l4":
+        // ...build the TCPChecker as in Phase 7...
+        srv := &proxy.L4Server{Balancer: bal, Logger: logger, ListenerName: l.Name}
+        go func() {
+            if err := srv.ListenAndServe(l.Listen, tlsConfig); err != nil {
+                logger.Error("l4 listener stopped", "listener", l.Name, "error", err)
+            }
+        }()
+        return srv, nil
+
+    case "l7":
+        // ...build the HTTPChecker as in Phase 7, then the *http.Server from Step 3...
+        return srv, nil
+
+    default:
+        return nil, fmt.Errorf("listener %q: unknown type %q", l.Name, l.Type)
+    }
+}
+```
+
+Only startup errors (bad algorithm, unknown listener type) come back synchronously now — an error once the server is already serving is logged from inside its goroutine instead, same as before.
+
+### Step 5 — collect the handles and wire up the signal (`cmd/gobalance/main.go`)
+
+Where the listener-starting loop used to fire-and-forget a goroutine per listener, collect what `startListener` now returns:
+
+```go
+var servers []shutdownableServer
+for _, l := range store.Get().Listeners {
+    p := pools[l.Name]
+    srv, err := startListener(l, p, tlsConfig, logger)
+    if err != nil {
+        fmt.Printf("listener %q failed to start: %v\n", l.Name, err)
+        continue
+    }
+    servers = append(servers, srv)
+}
+// ...build metricsSrv as in Step 3, then:
+servers = append(servers, metricsSrv)
+```
+
+Add a `-shutdown-timeout` flag next to the other flags (default `30*time.Second` is a reasonable starting point), then replace the `select {}` that used to keep `main` alive with an actual shutdown sequence:
+
+```go
+shutdownCh := make(chan os.Signal, 1)
+signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+<-shutdownCh
+logger.Info("shutdown signal received, draining", "timeout", shutdownTimeout.String())
+
+ctx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
+defer cancel()
+
+var wg sync.WaitGroup
+for _, srv := range servers {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := srv.Shutdown(ctx); err != nil {
+            logger.Warn("listener did not shut down cleanly", "error", err)
+        }
+    }()
+}
+wg.Wait()
+logger.Info("shutdown complete")
+```
+
+Shutting every listener down concurrently (rather than one after another) matters here: with a single shared `ctx` deadline, sequential shutdowns would let an earlier slow listener eat into the time budget of a later one.
+
+**Checkpoint:** start a slow request (a backend that sleeps a few seconds before responding), send `SIGTERM` to GoBalance immediately after (`kill -TERM $(pgrep -f gobalance)` or `Ctrl+C`), and confirm the in-flight request still completes successfully while a new connection attempt during the drain window is refused rather than accepted. `internal/proxy/l4_test.go`'s `TestL4Server_ShutdownDrainsInFlightConnections` automates exactly this scenario for the L4 path — worth reading even if you don't write it yourself, since it's the clearest proof that `Shutdown` is actually blocking on the `WaitGroup` and not just closing the listener and returning.
 
 ---
 

@@ -129,6 +129,48 @@ Idea: draw the second index from a range one shorter than the full backend list 
 
 With `>=`, the four raw values map onto `{0,1,3,4}` — exactly the four valid remaining indices, each hit once (a clean bijection). With `==`, only the *exact* collision (raw `2`) gets nudged; raw `3` doesn't equal `firstIdx` so it's left alone, but it was already supposed to land on `4` after the shift. Result: index `3` gets hit twice as often as it should, and index `4` is never reachable at all — a silent, statistical bias rather than a crash. The general principle: excluding one value from a range doesn't just require patching the single number that collides with it — every value *after* the excluded one has to shift to fill the gap, like closing a gap in a number line. `==` only patches the collision point; `>=` shifts the whole tail.
 
+## Graceful shutdown — why "stop the process" isn't good enough for a proxy
+
+Came up implementing Phase 8. The question worth answering first: why not just let `SIGTERM`/`Ctrl+C` kill the process like it would by default?
+
+**Without it:** the default disposition for `SIGTERM`/`SIGINT` just terminates the process. Every goroutine mid-flight — an `io.Copy` pump piping bytes between a client and backend, a `ReverseProxy.ServeHTTP` call in progress — dies with it, and the OS abruptly closes every open socket. From the client's side: a connection reset, or a response that stops halfway through, for no reason a client could ever diagnose.
+
+**Why that's specifically bad for a load balancer, not just any program:** GoBalance sits on every request between real clients and real backends — it's the one thing everything else routes through, not a batch job with no state mid-run. At any instant there are connections genuinely in progress. A routine restart (new binary, config change, `Ctrl+C` while testing) would look identical to an outage from the client's point of view, purely because of *when* you happened to hit stop. `CLAUDE.md`'s "config reload must not drop connections" is the same concern applied to reload instead of shutdown — both are about not letting a routine operational event masquerade as a failure.
+
+**What "graceful" means, mechanically — two steps, in order:**
+1. **Stop accepting new work immediately.** `ln.Close()` in `L4Server.Shutdown`; `http.Server.Shutdown` does the stdlib equivalent internally. No new connection gets a chance to start only to be killed moments later.
+2. **Let already-accepted work finish naturally, bounded by a timeout.** `L4Server` tracks in-flight connections with a `sync.WaitGroup`; `Shutdown` waits on it. The bound matters as much as the wait itself — a stuck client or hung backend could otherwise block shutdown forever, which just trades "clients see a reset" for "the operator's deploy hangs indefinitely." This is also why the timeout should sit a bit under whatever grace period an outer process manager (Docker, systemd, Kubernetes) gives before it sends `SIGKILL` — better to exit cleanly on your own terms than get force-killed mid-drain.
+
+**Mechanically, in plain terms — the door-and-tally picture.** The whole implementation is two primitives, nothing fancier:
+
+- **"Stop accepting" = slam a door shut.** `net.Listener.Accept()` blocks forever with no way to politely tell it "stop waiting now" — the *only* way to interrupt it in Go is to close the listener out from under it. `ln.Close()` makes a blocked `Accept()` return an error immediately, like a customer arriving to find the door suddenly locked instead of being turned away.
+- **"Let in-flight work finish" = a tally counter.** Every accepted connection does `wg.Add(1)` ("+1 customer still eating") right before its `handleConn` goroutine starts, and `defer wg.Done()` ("-1, they left") when it returns. `wg.Wait()` just means "block here until the tally is back to zero."
+
+`Shutdown` is then only: lock the door, wait for the tally to hit zero, but don't wait past the timeout:
+
+```go
+ln.Close()                                   // lock the door
+go func() { s.wg.Wait(); close(done) }()     // watch the tally in the background
+select {
+case <-done:       return nil                // tally hit zero in time
+case <-ctx.Done(): return ctx.Err()           // ran out of patience, leave anyway
+}
+```
+
+The `closed` bool exists purely so the accept loop can tell "the door was locked on purpose by `Shutdown`" apart from "a real, transient `Accept` error" — `Accept()` returns an error either way, and only the flag says which one happened (own-purpose error → return cleanly; transient error → keep looping).
+
+The `select` races two things against each other — "tally reached zero" vs. "timer expired" — because `wg.Wait()` by itself has no built-in deadline. Running it in its own goroutine and signaling a `done` channel is what lets a timeout race against it at all.
+
+**Why one `Shutdown(ctx) error` method signature, shared by `*proxy.L4Server` and `*http.Server`.** L4 (raw `net.Listener`) has no built-in drain mechanism; L7 (`net/http`) already ships one. Rather than writing two different shutdown code paths in `main`, `L4Server.Shutdown` was written to match `http.Server.Shutdown`'s exact signature, so both listener types — plus the metrics server, also an `*http.Server` — satisfy one tiny `shutdownableServer` interface and `main` can drain all of them identically:
+
+```go
+type shutdownableServer interface {
+    Shutdown(ctx context.Context) error
+}
+```
+
+**Why the shutdowns run concurrently, not one after another.** All servers share a single `ctx` deadline from `-shutdown-timeout`. If listener A's `Shutdown` were called, awaited, *then* listener B's, a slow drain on A would eat into B's share of the same fixed budget for no good reason — the two listeners' in-flight connections have nothing to do with each other. Firing every `Shutdown(ctx)` call in its own goroutine and `wg.Wait()`-ing on all of them means each one gets the *full* timeout window, independently.
+
 ## `-tls=false` gotcha — your test client has to match the mode you ran the server in
 
 `cmd/gobalance/main.go` has a `-tls` flag (default `true`) that picks between `tls.Listen`/`http.ListenAndServeTLS` and plain `net.Listen`/`http.ListenAndServe`. Ran it once with `-tls=false` to test the plaintext path, then reused the same TLS-probing commands from before it — got this from `openssl s_client`:

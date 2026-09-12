@@ -1,0 +1,40 @@
+# Same shape as configs/example.yaml, but pointed at the backend service
+# names docker-compose gives the http-echo containers (backend1/2/3:5678)
+# instead of localhost ports — the two configs can't share a listen address
+# since containers don't share gobalance's localhost namespace the way the
+# manual-testing dummy backends do.
+listeners:
+  - name: l4-demo
+    type: l4
+    listen: ":9090"
+    algorithm: round_robin
+    health_check:
+      interval: 1s
+      timeout: 2s
+      unhealthy_threshold: 2
+      healthy_threshold: 2
+    backends:
+      - addr: "backend1:5678"
+        weight: 1
+      - addr: "backend2:5678"
+        weight: 1
+      - addr: "backend3:5678"
+        weight: 1
+
+  - name: l7-demo
+    type: l7
+    listen: ":9091"
+    algorithm: round_robin
+    health_check:
+      path: /healthz
+      interval: 1s
+      timeout: 2s
+      unhealthy_threshold: 2
+      healthy_threshold: 2
+    backends:
+      - addr: "backend1:5678"
+        weight: 1
+      - addr: "backend2:5678"
+        weight: 1
+      - addr: "backend3:5678"
+        weight: 1

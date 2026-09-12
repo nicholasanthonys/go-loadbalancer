@@ -1,8 +1,42 @@
 # GoBalance
 
-A Layer 4 (raw TCP) / Layer 7 (HTTP) load balancer written in Go, built to demonstrate systems-level
-engineering — concurrency, networking, fault tolerance, and observability — rather than to compete
-with nginx/HAProxy/Envoy on features or performance.
+A Layer 4 (raw TCP) / Layer 7 (HTTP) load balancer written in Go from scratch — no reverse-proxy
+framework, no off-the-shelf load balancer wrapped in Go. It's built around three small,
+interchangeable abstractions (a concurrency-safe backend pool, a `Balancer` strategy interface with
+six algorithms, and a hysteresis-based health checker) that both listener types share, so adding a
+TLS toggle, a hot-reloadable config, or a new algorithm never means touching the proxy loop itself.
+The point of the project is to demonstrate systems-level engineering — concurrency correctness under
+`-race`, graceful failure handling, observability — rather than to compete with nginx/HAProxy/Envoy on
+features or performance; see [`docs/PRD.md`](docs/PRD.md) for the explicit non-goals.
+
+```
+                                   ┌─────────────────────────┐
+                                   │        GoBalance          │
+                                   │                          │
+ clients ──TCP/TLS──▶ L4 Listener │  ┌──────────────┐        │
+                                   │  │  Backend Pool │◀──┐    │
+ clients ──HTTP/TLS─▶ L7 Listener │  │  (per listener)│   │    │
+                                   │  └──────┬───────┘   │    │
+                                   │         │            │    │
+                                   │  ┌──────▼───────┐    │    │
+                                   │  │  Algorithm    │    │    │
+                                   │  │  (RR / LC /   │    │    │
+                                   │  │  Weighted...) │    │    │
+                                   │  └──────┬───────┘    │    │
+                                   │         │            │    │
+                                   │  ┌──────▼───────┐    │    │
+                                   │  │Health Checker │────┘    │
+                                   │  │(active+passive)│         │
+                                   │  └──────────────┘          │
+                                   │                          │
+                                   │  /metrics   /healthz     │
+                                   │  slog → stdout (JSON)    │
+                                   └────────────┬─────────────┘
+                                                │
+                                    ┌───────────┼───────────┐
+                                    ▼           ▼           ▼
+                               backend-1   backend-2   backend-3
+```
 
 Full design rationale lives in [`docs/`](docs/):
 
@@ -49,13 +83,33 @@ Currently implemented:
 - **Graceful shutdown** ([`internal/proxy/l4.go`](internal/proxy/l4.go)) — `SIGTERM`/`SIGINT` stops
   new connections and drains in-flight ones (bounded by `-shutdown-timeout`, default 30s) across all
   listeners concurrently before exiting.
+- **Docker Compose demo** ([`deploy/`](deploy/)) — `deploy/Dockerfile` builds a static binary onto
+  `distroless/static`; `deploy/docker-compose.yaml` runs it alongside three `hashicorp/http-echo`
+  backends using [`configs/docker.yaml`](configs/docker.yaml) (same shape as `example.yaml`, addresses
+  swapped to compose service names).
 
-Not yet implemented: the Docker Compose demo (Phase 10). See [`docs/TUTORIAL.md`](docs/TUTORIAL.md)'s
-progress table for exact phase-by-phase status.
+All phases through Phase 10 are done. See [`docs/TUTORIAL.md`](docs/TUTORIAL.md)'s progress table for
+exact phase-by-phase status; Phase 11 (portfolio polish) is what's left.
 
 ## Running it
 
-Requires Go 1.21+.
+The fastest path is the Docker Compose demo:
+
+```bash
+docker compose -f deploy/docker-compose.yaml up --build
+```
+
+This builds gobalance and starts it alongside three dummy backends, no local Go toolchain or
+manual backend setup needed. Once it's up:
+
+```bash
+for i in 1 2 3; do curl -s localhost:8080; done
+```
+
+cycles across the three backends, and `docker kill deploy-backend1-1` (or whatever `docker compose
+ps` names it) shows failover live in `docker compose logs -f gobalance`.
+
+To run it directly instead — useful for iterating on the code — requires Go 1.21+.
 
 `-tls` defaults to `true`, so generate a self-signed dev certificate first (skip this if you plan to
 run with `-tls=false`):

@@ -1,0 +1,26 @@
+# deploy/docker-compose.yaml
+services:
+  gobalance:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:9091" # L7 HTTP
+      - "9090:9090" # L4 TCP
+      - "9100:9100" # Prometheus metrics
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+
+  backend1:
+    image: hashicorp/http-echo
+    command: ["-text=hello from backend-1"]
+
+  backend2:
+    image: hashicorp/http-echo
+    command: ["-text=hello from backend-2"]
+
+  backend3:
+    image: hashicorp/http-echo
+    command: ["-text=hello from backend-3"]
